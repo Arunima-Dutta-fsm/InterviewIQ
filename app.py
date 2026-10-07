@@ -272,8 +272,15 @@ TOTAL_QUESTIONS = 12
 # Low thinking is intentional here: interview scoring/question generation
 # benefits from fast structured output more than long reasoning.
 THINKING_LEVEL = "low"
-MAX_OUTPUT_TOKENS = 1500
+MAX_OUTPUT_TOKENS = 2500
 RECENT_HISTORY_COUNT = 3
+# Reliability settings
+# One Gemini request cannot run longer than 12 seconds.
+GEMINI_REQUEST_TIMEOUT_MS = 12000
+
+# One complete Gemini call, including fallback attempts, cannot
+# consume more than 60 seconds.
+GEMINI_TOTAL_BUDGET_SECONDS = 60
 
 TEMPORARY_ERRORS = [
     "503",
@@ -326,9 +333,8 @@ def clean_json_response(text):
 
     return text.strip()
 
-
 def call_gemini(prompt):
-    """Fast Gemini call with the required fallback strategy."""
+    """Gemini call with bounded timeout and controlled fallback strategy."""
 
     if client is None:
         raise Exception(
@@ -340,8 +346,20 @@ def call_gemini(prompt):
     call_started = time.perf_counter()
 
     for model_name, max_attempts in MODEL_STRATEGY:
+
         for attempt in range(1, max_attempts + 1):
+
+            # --------------------------------------------------------
+            # GLOBAL TIME BUDGET CHECK
+            # --------------------------------------------------------
+
+            total_elapsed = time.perf_counter() - call_started
+
+            if total_elapsed >= GEMINI_TOTAL_BUDGET_SECONDS:
+                break
+
             try:
+
                 start_time = time.perf_counter()
 
                 response = client.models.generate_content(
@@ -352,46 +370,97 @@ def call_gemini(prompt):
                         thinking_config=types.ThinkingConfig(
                             thinking_level=THINKING_LEVEL
                         ),
-                        max_output_tokens=MAX_OUTPUT_TOKENS
+                        max_output_tokens=MAX_OUTPUT_TOKENS,
+                        http_options=types.HttpOptions(
+                            timeout=GEMINI_REQUEST_TIMEOUT_MS
+                        )
                     )
                 )
 
                 elapsed = time.perf_counter() - start_time
 
                 if response and response.text:
+
                     request_seconds = round(elapsed, 1)
-                    total_elapsed = round(time.perf_counter() - call_started, 1)
+                    total_elapsed = round(
+                        time.perf_counter() - call_started, 1
+                    )
+
                     st.session_state.last_model_used = model_name
                     st.session_state.last_gemini_seconds = total_elapsed
+
                     st.session_state.gemini_call_log.append({
                         "model": model_name,
                         "seconds": total_elapsed,
                         "request_seconds": request_seconds,
                     })
+
                     return response.text
 
                 raise Exception("Gemini returned an empty response.")
 
             except Exception as e:
+
                 last_error = e
                 error_message = str(e)
 
-                is_temporary_error = any(
-                    error_code in error_message
-                    for error_code in TEMPORARY_ERRORS
+                # ----------------------------------------------------
+                # DETERMINE WHETHER THIS ERROR CAN TRIGGER FALLBACK
+                # ----------------------------------------------------
+
+                is_timeout = (
+                    isinstance(e, TimeoutError)
+                    or "timeout" in error_message.lower()
+                    or "timed out" in error_message.lower()
+                )
+
+                is_temporary_error = (
+                    is_timeout
+                    or any(
+                        error_code in error_message
+                        for error_code in TEMPORARY_ERRORS
+                    )
                 )
 
                 # Permanent errors surface immediately.
                 if not is_temporary_error:
                     raise e
 
-                # Fast retry backoff: 1s, then 2s.
+                # ----------------------------------------------------
+                # CHECK GLOBAL TIME BUDGET BEFORE RETRY
+                # ----------------------------------------------------
+
+                total_elapsed = time.perf_counter() - call_started
+
+                if total_elapsed >= GEMINI_TOTAL_BUDGET_SECONDS:
+                    break
+
+                # Fast retry backoff.
                 if attempt < max_attempts:
-                    time.sleep(2 ** (attempt - 1))
+
+                    remaining_time = (
+                        GEMINI_TOTAL_BUDGET_SECONDS - total_elapsed
+                    )
+
+                    sleep_time = min(1, max(0, remaining_time))
+
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+
+        # Move to the next fallback model.
+
+    # ------------------------------------------------------------
+    # ALL ATTEMPTS EXHAUSTED OR GLOBAL TIME BUDGET REACHED
+    # ------------------------------------------------------------
+
+    total_elapsed = round(
+        time.perf_counter() - call_started, 1
+    )
 
     raise Exception(
-        "Gemini service is temporarily unavailable across all configured "
-        "fallback models. Please try again later. "
+        "Gemini could not complete the request within the "
+        f"{GEMINI_TOTAL_BUDGET_SECONDS}-second reliability limit. "
+        "Please try again. "
         f"Last error: {last_error}"
     )
 
